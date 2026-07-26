@@ -38,7 +38,7 @@ const SuperAdminProfilePage = () => {
     const [originalValues, setOriginalValues] = useState({
         name: DUMMY_PROFILE.name,
         email: DUMMY_PROFILE.email
-    })
+    });
     const [isPending, setIsPending] = useState(false);
 
     const {
