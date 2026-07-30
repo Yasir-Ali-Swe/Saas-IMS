@@ -9,64 +9,76 @@ import {
 } from "../services/chatTools.service.js";
 import chatLogModel from "../models/chatLog.model.js";
 import { GEMINI_API_KEY, GEMINI_MODEL } from "../config/env.js";
+import { CONSTANTS } from "../config/constants.js";
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-// In-memory context cache: key = `${orgId}_${userId}_${conversationId}`
-const contextCache = new Map();
-const FOLLOW_UP_WORDS = [
-  "those",
-  "them",
-  "these",
-  "that",
-  "they",
-  "it",
-  "more",
-  "again",
-  "update",
-  "instead",
-];
+class ContextCache {
+  constructor() {
+    this.cache = new Map();
+    this.ttl = CONSTANTS.CONTEXT_CACHE_TTL * 1000;
+  }
 
-/**
- * Extract conversationId from request body, query, or generate a new one.
- */
+  set(key, value) {
+    this.cache.set(key, {
+      value,
+      timestamp: Date.now(),
+    });
+  }
+
+  get(key) {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+
+    if (Date.now() - entry.timestamp > this.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+
+    return entry.value;
+  }
+
+  delete(key) {
+    this.cache.delete(key);
+  }
+
+  clearByPrefix(prefix) {
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (now - entry.timestamp > this.ttl) {
+        this.cache.delete(key);
+      }
+    }
+  }
+}
+
+const contextCache = new ContextCache();
+setInterval(() => contextCache.cleanup(), 5 * 60 * 1000);
+
 const getConversationId = (req) =>
   req.body?.conversationId || req.query?.conversationId || randomUUID();
 
-/**
- * Helper to extract structured data from tool results.
- */
 const extractData = (toolResult) => {
-  const dataKeys = [
-    "products",
-    "product",
-    "suppliers",
-    "supplier",
-    "invoices",
-    "invoice",
-    "orders",
-    "purchase_order",
-    "forecasts",
-    "forecast",
-    "anomalies",
-    "suggestions",
-    "users",
-    "user",
-    "organizations",
-    "organization",
-    "category",
-    "insights",
-    "dashboard",
-    "abcAnalysis",
-    "deadStock",
-    "groupedResults",
-    "vendorPerformance",
-    "customerMetrics",
-    "transactions",
-    "metrics",
-    "summary"
-  ];
-  for (const key of dataKeys) {
+  if (!toolResult) return null;
+  if (toolResult.invoice?.lineItems) return toolResult.invoice.lineItems;
+  if (toolResult.purchaseOrder?.lineItems)
+    return toolResult.purchaseOrder.lineItems;
+  if (toolResult.supplier?.productsList)
+    return toolResult.supplier.productsList;
+  if (toolResult.category?.productsList)
+    return toolResult.category.productsList;
+  if (toolResult.summary?.customerProductsPurchased)
+    return toolResult.summary.customerProductsPurchased;
+
+  for (const key of CONSTANTS.DATA_KEYS) {
     if (toolResult[key]) return toolResult[key];
   }
   return null;
@@ -77,166 +89,330 @@ const createEmptyContext = () => ({
   lastResults: null,
   lastTool: null,
   conversationCount: 0,
+  organizationId: null,
+  lastPage: 1,
+  lastFilters: null,
 });
 
-const getContextKey = (organizationId, userId, conversationId) =>
-  `${organizationId}_${userId}_conversation_${conversationId}`;
+const getContextKey = (organizationId, userId, conversationId) => {
+  const orgPart = organizationId || "super_admin";
+  return `${orgPart}_${userId}_conversation_${conversationId}`;
+};
+
+const buildFollowUpContext = (lastResults, lastTool) => {
+  if (!lastResults) return "{}";
+
+  if (lastResults.summary && Object.keys(lastResults.summary).length > 0) {
+    return JSON.stringify(lastResults.summary);
+  }
+
+  const primaryKeys = [
+    "products",
+    "invoices",
+    "orders",
+    "transactions",
+    "anomalies",
+    "suggestions",
+    "users",
+    "organizations",
+    "forecasts",
+    "groupedResults",
+    "deadStock",
+    "dashboard",
+  ];
+  const fallback = {
+    count: lastResults.count || 0,
+    tool: lastTool,
+    sample: [],
+  };
+
+  for (const key of primaryKeys) {
+    if (Array.isArray(lastResults[key]) && lastResults[key].length > 0) {
+      fallback.sample = lastResults[key].slice(0, 3);
+      break;
+    }
+  }
+  return JSON.stringify(fallback);
+};
 
 const getEnhancedQuery = (query, context) => {
   let enhancedQuery = query;
+  const lowerQuery = query.toLowerCase();
 
-  if (
-    context.lastResults &&
-    context.lastTool &&
-    FOLLOW_UP_WORDS.some((word) => query.toLowerCase().includes(word))
-  ) {
-    enhancedQuery = `${query} (Based on previous results of executing tool ${context.lastTool}. Previous results summary: ${JSON.stringify(context.lastResults.summary || {})})`;
+  const isFollowUpWord = CONSTANTS.FOLLOW_UP_WORDS.some((word) =>
+    lowerQuery.includes(word.toLowerCase()),
+  );
+
+  // Strictly referential pronouns only. Do NOT treat domain nouns like "product" or "supplier" as pronouns.
+  const isEntityPronoun = /\b(it|this|that|these|those|its|their|them|the same)\b/i.test(lowerQuery);
+
+  if (context.activeEntity && (isFollowUpWord || isEntityPronoun)) {
+    const activeInfo = JSON.stringify({
+      type: context.activeEntity.type,
+      identifier: context.activeEntity.identifier,
+      summary:
+        context.activeEntity.data?.invoice?.general ||
+        context.activeEntity.data?.purchaseOrder?.general ||
+        context.activeEntity.data?.supplier?.info ||
+        context.activeEntity.data?.product?.general ||
+        {},
+    });
+    enhancedQuery = `${query} (Background reference entity: ${activeInfo}. NOTE: Do NOT apply or reuse filters unless explicitly requested in: "${query}")`;
+  } else if (context.lastResults && context.lastTool && isFollowUpWord) {
+    const contextSnippet = buildFollowUpContext(
+      context.lastResults,
+      context.lastTool,
+    );
+    enhancedQuery = `${query} (Background reference from previous tool ${context.lastTool}: ${contextSnippet}. NOTE: Do NOT apply or reuse filters like supplier, category, or status unless explicitly requested in: "${query}")`;
   }
 
   return enhancedQuery;
 };
 
-const SYSTEM_INSTRUCTION = `You are StockPilot AI, the intelligent inventory and business analytics assistant built into the StockPilot platform.
+const extractSuggestedQuestions = (reply, userQuery = "") => {
+  if (!reply) return [];
 
-IDENTITY & PERSONA
-- Identify yourself ONLY as StockPilot AI.
-- If the user asks about your identity, creator, owner, model, or developer, respond EXACTLY with:
-  "I'm StockPilot AI, your intelligent inventory and business analytics assistant. I help you analyze products, inventory, purchases, suppliers, invoices, sales, team performance, and other business data stored in your StockPilot workspace. I provide read-only insights, reports, analytics, and recommendations to help you make better business decisions."
-- NEVER mention "Google Gemini", "Google AI", "Large Language Model", "LLM", "OpenAI", "ChatGPT", "Google model", or similar AI technology providers.
-- DO NOT introduce yourself in every response. Only introduce yourself when the user explicitly asks about your identity, creator, owner, model, or developer.
-- You must speak like a professional inventory analyst, a business intelligence assistant, or an ERP consultant. Do not sound like a machine, a generic chatbot, or a database query engine.
+  let rawLines = [];
+  const match = reply.match(
+    /💬\s*SUGGESTED QUESTIONS[\s\S]*?\n([\s\S]*?)(?=\n#{1,6}\s|\n💬|\n📦|\n📊|\n💡|\n🎯|$)/i,
+  );
 
-CONVERSATIONAL RULES (REMOVE ROBOTIC FEEL)
-1. VARY INTRODUCTIONS: Do not use repetitive openings (e.g. "Here is the report", "Below is the summary", "Based on current data", "Here is the business overview", "Here are the results"). Vary the opening naturally based on the question:
-   - "I found 16 products currently in your inventory."
-   - "Here's a quick overview of how your business is performing."
-   - "I found 8 invoices matching your request."
-   - "Your organization currently has four active team members."
-2. NO REPETITIVE ENDINGS: Do not append generic templates to the end of every response (e.g. "Let me know if you need anything else", "Would you like me to...", "Please let me know if..."). End naturally and concisely. Only ask follow-up questions when they are highly relevant and genuinely help continue the current business analysis.
-3. CONVERSATIONAL EXPRESSIONS: Explain numbers naturally instead of just spitting out raw records:
-   - "Your organization currently has four active team members" instead of "There are currently 4 team members."
-   - "Your inventory is currently valued at..." instead of "Inventory valuation is...".
-4. INTRODUCE DATA STRUCTURES: Always introduce tables, lists, or large segments with a short, 1-2 sentence natural summary drawing attention to the most important business finding or alert (e.g., "Most of your inventory value comes from Electronics, while Category X holds the highest stock volume.").
-5. MEANINGFUL AI INSIGHTS: Whenever sufficient data exists, include 2–5 concise, bulleted business insights (e.g., "Electronics contributes most of your inventory value", "The Shoe category has the highest profit margin", "Two products haven't sold in over 60 days"). Insights must always derive directly from the actual database data; never invent, estimate, or hallucinate trends or insights.
-6. LAYOUT VARIETY: Vary your response structures to keep them fresh. Use different layout configurations:
-   - Pattern A: Dynamic Summary -> Table -> Bullets of Insights
-   - Pattern B: Key findings / highlights -> Table
-   - Pattern C: Short highlights -> Markdown Sections -> Table -> Insights
-7. DASHBOARD IDENTITIES: Give each workspace summary request a unique identity:
-   - "Business Overview": High-level performance summary of sales, revenue, cost, and stock valuation.
-   - "Organization Snapshot": Complete operational picture focusing on team member roles, active suppliers, status, and category counts.
-   - "Business Dashboard": Detailed KPIs and metrics (total valuation, profit margins, sales counts, pending order alerts).
-   - "Executive Summary": High-level management highlights focusing on profitability (gross margin, actual/potential profit, top margin products, and severe alerts).
+  if (match && match[1]) {
+    rawLines = match[1]
+      .split("\n")
+      .map((line) =>
+        line
+          .replace(/^[\d]+\.\s*/, "")
+          .replace(/^[•\-*]\s*/, "")
+          .trim(),
+      )
+      .filter((q) => q.length > 5);
+  } else {
+    const fallback = reply.match(
+      /💬\s*SUGGESTED QUESTIONS[^\n]*\n((?:[ \t]*(?:[•\-*]|\d+\.)[^\n]+\n?)+)/i,
+    );
+    if (fallback && fallback[1]) {
+      rawLines = fallback[1]
+        .split("\n")
+        .map((line) =>
+          line
+            .replace(/^[\d]+\.\s*/, "")
+            .replace(/^[•\-*]\s*/, "")
+            .trim(),
+        )
+        .filter((q) => q.length > 5);
+    }
+  }
 
-READ-ONLY ENFORCEMENT
-- You are strictly a READ-ONLY assistant. You must NEVER perform or claim to perform any write operations (such as creating, inserting, updating, deleting, editing, approving, rejecting, voiding, or cancelling products, suppliers, categories, invoices, purchase orders, team members, or adjustments).
-- If a user asks you to perform a write operation (e.g., "delete product Samsung TV", "create a supplier", "update invoice status"), you MUST politely refuse, explain that you support read-only analysis and reporting, and offer to analyze the current data instead.
+  if (rawLines.length === 0) return [];
 
-DATABASE SCHEMA AWARENESS
-You are fully aware of all database schemas and queryable fields in the StockPilot database. Never say fields or information do not exist if they are listed below:
-1. Product Schema:
-   - name (String)
-   - categoryId (ref Category)
-   - supplierId (ref Supplier)
-   - sku (String)
-   - quantity (Number, current stock level)
-   - reorderThreshold (Number, reorder level)
-   - costPrice (Number, purchase/cost price of the product)
-   - sellingPrice (Number)
-   - unit ("piece", "kg", "liter", "box")
-   - isActive (Boolean)
-   - createdBy (ref User)
-2. Category Schema:
-   - name (String)
-   - categorySlug (String)
-3. Supplier Schema:
-   - name (String)
-   - contactPerson (String)
-   - email (String)
-   - phone (String)
-   - address (String)
-   - leadTimeDays (Number, supplier delivery lead time)
-4. Invoice (Sales Schema):
-   - customerName (String)
-   - invoiceNumber (String)
-   - products (Array of: productId, quantity, sellingPrice, subtotal)
-   - subtotal (Number)
-   - tax (Number)
-   - discount (Number)
-   - total (Number)
-   - status ("paid", "unpaid", "void")
-   - createdBy (ref User, the staff member who generated the invoice)
-5. PurchaseOrder Schema:
-   - poNumber (String)
-   - supplierId (ref Supplier)
-   - items (Array of: productId, quantity, unitCost)
-   - totalCost (Number)
-   - status ("pending", "approved", "rejected", "fulfilled")
-   - createdBy (ref User, the staff member who created the order)
-   - approvedBy (ref User, the admin who approved it)
-6. User (Team Member Schema):
-   - name (String)
-   - email (String)
-   - role ("super_admin", "admin", "manager", "staff")
-   - isActive (Boolean)
-   - organizationId (ref Organization)
-7. Organization Schema:
-   - name (String)
-   - contactEmail (String)
-   - phone (String)
-   - address (String)
-   - status (String)
-8. StockLog (Inventory Stock Transaction Schema):
-   - productId (ref Product)
-   - type ("in", "out")
-   - reason ("purchase", "sale", "adjustment", "return", "damage")
-   - relatedInvoiceId (ref Invoice)
-   - relatedPurchaseOrderId (ref PurchaseOrder)
-   - quantity (Number)
-   - performedBy (ref User, the staff member who did the stock movement)
-9. ProductForecast Schema:
-   - productId (ref Product)
-   - forecastPeriod (String e.g. "7_days", "30_days", "90_days")
-   - predictedDemand (Number)
-   - confidence (Number)
-10. ReorderSuggestion Schema:
-    - productId (ref Product)
-    - suggestedReorderQuantity (Number)
-    - suggestedReorderDate (Date)
-    - status (String)
-11. Anomaly Schema:
-    - productId (ref Product)
-    - type (String)
-    - description (String)
-    - severity ("low", "medium", "high")
-    - isResolved (Boolean)
+  const normalize = (str) =>
+    (str || "")
+      .toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-METRICS & CALCULATIONS
-Perform and discuss all metrics calculations automatically using these formulas:
-- Unit Profit = sellingPrice - costPrice
-- Profit Per Product (inventory potential profit) = quantity * (sellingPrice - costPrice)
-- Invoice Profit = invoice.total - costOfGoodsSold (where costOfGoodsSold is the sum of quantity * costPrice of each product in the invoice)
-- Total Sales Profit = sum of paid invoice profits
-- Profit Margin = (sellingPrice - costPrice) / sellingPrice (percentage representation is margin * 100)
-- Valuation (Inventory Value) = quantity * costPrice
-- Potential Revenue = quantity * sellingPrice
-- Potential Profit = Potential Revenue - Valuation (same as Profit Per Product sum)
-- Gross Margin = Total Sales Profit / Total Paid Invoice Revenue
+  const userNorm = normalize(userQuery);
+  const userWords = new Set(
+    userNorm
+      .split(" ")
+      .filter(
+        (w) =>
+          w.length > 3 &&
+          ![
+            "show",
+            "list",
+            "what",
+            "which",
+            "with",
+            "have",
+            "from",
+            "that",
+            "this",
+            "items",
+            "products",
+            "please",
+          ].includes(w),
+      ),
+  );
 
-MARKDOWN TABLES GENERATION
-- When presenting list-based datasets, summaries, lists, snapshots, overviews, or reports (such as products, category valuation, unpaid invoices, team members, suppliers, purchases, dead stock, and dashboards), you MUST format the output as a clean, structured Markdown table.
-- Choose columns dynamically that make business sense:
-  - Products: Name, SKU, Stock, Cost Price, Selling Price, Potential Valuation, Potential Profit, Profit Margin (%), Reorder Level, Status, ABC Class.
-  - Invoices/Sales: Invoice Number, Customer, Date, Total, Status, COGS, Profit, Margin (%), Created By.
-  - Suppliers: Name, Contact, Email, Lead Time (Days), Active Products Count.
-  - Purchase Orders: PO Number, Supplier, Items Count, Total Cost, Status, Created By, Date.
-  - Categories: Name, Slug, Product Count, Total Stock, Valuation.
-  - Users/Team: Name, Email, Role, Status, Created At.
-  - Transactions/Stock logs: Product, SKU, Type (In/Out), Reason, Quantity, Performed By, Ref Number, Date.
-- Never use plain lists or raw paragraph descriptions for tabular data. Always output tables.
+  const seenNorms = new Set();
+  const filtered = [];
+  for (const q of rawLines) {
+    const qNorm = normalize(q);
+    if (!qNorm || qNorm.length < 8) continue;
+    if (qNorm === userNorm) continue;
+    if (userNorm && (qNorm.includes(userNorm) || userNorm.includes(qNorm)))
+      continue;
+    if (seenNorms.has(qNorm)) continue;
 
-TONE & ACCESS
-- Never leak data across organizations. Super Admins can search across organizations, whereas Org Admins are restricted to their own organization. Managers and staff have no access to the chatbot.`;
+    const qWords = qNorm
+      .split(" ")
+      .filter(
+        (w) =>
+          w.length > 3 &&
+          ![
+            "show",
+            "list",
+            "what",
+            "which",
+            "with",
+            "have",
+            "from",
+            "that",
+            "this",
+            "items",
+            "products",
+            "please",
+            "details",
+            "invoice",
+          ].includes(w),
+      );
+    if (qWords.length > 0 && userWords.size > 0) {
+      const matchCount = qWords.filter((w) => userWords.has(w)).length;
+      const overlapRatio = matchCount / Math.max(qWords.length, 1);
+      if (overlapRatio > 0.6) {
+        continue;
+      }
+    }
+
+    seenNorms.add(qNorm);
+    filtered.push(q);
+  }
+
+  return filtered;
+};
+
+const SYSTEM_INSTRUCTION = `You are StockPilot AI, an Inventory Analyst for StockPilot.
+
+IDENTITY & TONE:
+- Identify as "StockPilot AI" only when asked about your identity.
+- Never mention Google, Gemini, LLM, or AI providers.
+- Write like a knowledgeable, helpful colleague. Short, direct sentences.
+
+ROLE-BASED ACCESS:
+- Admin: Can only access their organization's data.
+- Super Admin: Can access all organizations.
+- Both roles have READ-ONLY permissions. Politely refuse write requests in 1-2 plain sentences without headers.
+
+CONVERSATIONAL & SIMPLE QUERIES:
+- For greetings, identity questions, capability overviews, unsupported feature requests, write refusals, or simple queries:
+  - Respond in 1–3 plain natural sentences.
+  - DO NOT include Markdown headers (e.g. ## 📦 SUMMARY, ## 📊 PRIMARY CONTENT).
+  - DO NOT output empty markdown tables or boilerplate checklists.
+
+DATA-DRIVEN RESPONSES WITH RETRIEVED DATA:
+- Use the structured markdown template ONLY when reporting real retrieved dataset results:
+  ## 📦 SUMMARY
+  (Key overview metrics as bullet points)
+
+  ## 📊 PRIMARY CONTENT
+  (Markdown table of retrieved rows)
+
+  ## 💡 AI INSIGHTS
+  (2-3 comparative analytical observations — DO NOT just restate single cell values)
+
+  ## 🎯 RECOMMENDATIONS
+  (2-3 actionable next steps if risks or low/dead stock exist)
+
+PAGINATION RULE:
+- When a stated pagination range is provided in the prompt (e.g. "showing 1–10 of 16"), state that exact range word-for-word. Never recalculate or alter it.
+
+HARD STOP: Stop after completing response. No wrap-up or restatement.`;
+
+const trimToolResult = (result) => {
+  if (!result || typeof result !== "object") return result;
+  // Do not slice arrays if tool result is already a paginated page from backend
+  if (
+    result.page !== undefined ||
+    result.totalPages !== undefined ||
+    result.showingRange !== undefined
+  ) {
+    return result;
+  }
+  const trimmed = { ...result };
+
+  for (const [key, value] of Object.entries(trimmed)) {
+    if (CONSTANTS.SUMMARY_KEYS.has(key)) continue;
+
+    if (Array.isArray(value) && value.length > CONSTANTS.MAX_ARRAY_ITEMS) {
+      trimmed[`${key}TotalCount`] = value.length;
+      trimmed[key] = value.slice(0, CONSTANTS.MAX_ARRAY_ITEMS);
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      trimmed[key] = trimToolResult(value);
+    }
+  }
+  return trimmed;
+};
+
+const detectSchema = (query, toolName, data) => {
+  if (!data || (Array.isArray(data) && data.length === 0)) {
+    return null;
+  }
+
+  if (toolName === "get_details") {
+    const sample = Array.isArray(data) && data.length > 0 ? data[0] : data;
+    if (sample.unitPrice !== undefined && sample.quantity !== undefined)
+      return "invoice_items";
+    if (sample.unitCost !== undefined && sample.totalCost !== undefined)
+      return "po_items";
+    if (
+      sample.quantityPurchased !== undefined &&
+      sample.totalSpent !== undefined
+    )
+      return "customer_purchases";
+    if (sample.costPrice !== undefined && sample.sellingPrice !== undefined)
+      return "products_compact";
+  }
+
+  if (toolName === "query_sales") {
+    const sample = Array.isArray(data) && data.length > 0 ? data[0] : null;
+    if (sample && sample.quantityPurchased !== undefined)
+      return "customer_purchases";
+    return "sales";
+  }
+
+  if (toolName === "query_inventory") {
+    const lowerQuery = (query || "").toLowerCase();
+    const isDetailed =
+      lowerQuery.includes("detail") ||
+      lowerQuery.includes("complete") ||
+      lowerQuery.includes("all field") ||
+      lowerQuery.includes("every field") ||
+      lowerQuery.includes("full info") ||
+      lowerQuery.includes("margin") ||
+      lowerQuery.includes("cost price") ||
+      lowerQuery.includes("profit") ||
+      lowerQuery.includes("valuation") ||
+      lowerQuery.includes("supplier") ||
+      lowerQuery.includes("category");
+
+    return isDetailed ? "products_detailed" : "products_compact";
+  }
+
+  if (toolName === "query_purchases") return "purchases";
+  if (toolName === "query_transactions") return "transactions";
+  if (toolName === "query_organization") {
+    const sample = Array.isArray(data) && data.length > 0 ? data[0] : null;
+    if (sample && sample.contactEmail !== undefined) {
+      return "organizations";
+    }
+    return "users";
+  }
+  if (toolName === "query_insights") {
+    if (Array.isArray(data) && data.length > 0) {
+      const sample = data[0];
+      if (sample.predictedDemand !== undefined) return "forecast";
+      if (sample.severityDisplay !== undefined || sample.severity !== undefined)
+        return "anomalies";
+      if (sample.suggestedReorderQuantity !== undefined) return "suggestions";
+      if (sample.daysWithoutSale !== undefined) return "deadStock";
+    }
+  }
+
+  return null;
+};
 
 const getChatModel = (role) => {
   const tools = getToolsForRole(chatTools[0].functionDeclarations, role);
@@ -245,6 +421,10 @@ const getChatModel = (role) => {
     model: GEMINI_MODEL,
     tools: [{ functionDeclarations: tools }],
     systemInstruction: SYSTEM_INSTRUCTION,
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 2048,
+    },
   });
 
   return { model, tools };
@@ -254,6 +434,10 @@ const getPlainModel = () =>
   genAI.getGenerativeModel({
     model: GEMINI_MODEL,
     systemInstruction: SYSTEM_INSTRUCTION,
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 2048,
+    },
   });
 
 const setStreamHeaders = (res) => {
@@ -273,14 +457,33 @@ const sendStreamEvent = (res, payload) => {
 const getFallbackReply = (toolResult) => {
   const count = toolResult.count || 0;
   const summary = toolResult.summary || {};
+  return `## 📦 SUMMARY
+- Found ${count} results for your query.
+- Total value: PKR ${formatCurrency(summary.totalValue || 0)}
 
-  return `I found ${count} results for your query. ${summary.totalValue ? `Total value: $${summary.totalValue}. ` : ""
-    }Please check the data for more details.`;
+## 📊 PRIMARY CONTENT
+| Result Count | Total Value |
+| --- | --- |
+| ${count} | PKR ${formatCurrency(summary.totalValue || 0)} |
+
+## 💡 AI INSIGHTS
+- No additional insights available.
+
+## 🎯 RECOMMENDATIONS
+- Please refine your query for more specific recommendations.
+
+💬 SUGGESTED QUESTIONS:
+- Try asking "Show me more details about these products"
+- Try asking "Which products are low in stock?"`;
 };
 
-/**
- * Chat with AI – supports conversation ID to maintain separate contexts.
- */
+const formatCurrency = (value) => {
+  return Number(value).toLocaleString("en-PK", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+};
+
 export const chatWithAI = async (req, res) => {
   try {
     const organizationId = req.organizationId;
@@ -288,37 +491,44 @@ export const chatWithAI = async (req, res) => {
     const role = req.user.role;
     const { query } = req.body;
 
-    // Get or generate conversation ID
     const conversationId = getConversationId(req);
 
-    if (!query) {
+    if (!query || query.trim().length === 0) {
       return res.status(400).json({
         success: false,
         message: "Query is required",
       });
     }
 
-    // Build context key and retrieve conversation context
+    if (query.length > 500) {
+      return res.status(400).json({
+        success: false,
+        message: "Query is too long (maximum 500 characters)",
+      });
+    }
+
     const contextKey = getContextKey(organizationId, userId, conversationId);
     let context = contextCache.get(contextKey) || createEmptyContext();
 
-    // Enhance query with previous context if it's a follow-up
-    const enhancedQuery = getEnhancedQuery(query, context);
+    if (organizationId) {
+      context.organizationId = organizationId;
+    }
 
-    // Get tools based on user role
+    const enhancedQuery = getEnhancedQuery(query, context);
     const { model } = getChatModel(role);
 
     const chat = model.startChat();
     const result = await chat.sendMessage(enhancedQuery);
     const call = result.response.functionCalls()?.[0];
 
-    // If no tool called, return text response
     if (!call) {
       let replyText = result.response.text();
       if (!replyText || replyText.trim() === "") {
         replyText =
           "I understand your request, but I couldn't generate a proper response. Could you please rephrase your question?";
       }
+
+      const suggestedQuestions = extractSuggestedQuestions(replyText);
 
       await chatLogModel.create({
         organizationId,
@@ -327,6 +537,7 @@ export const chatWithAI = async (req, res) => {
         query,
         response: replyText,
         intent: null,
+        metadata: { suggestedQuestions },
       });
 
       contextCache.set(contextKey, {
@@ -343,11 +554,16 @@ export const chatWithAI = async (req, res) => {
         reply: replyText,
         type: "text",
         data: null,
+        suggestedQuestions,
       });
     }
 
-    // Execute the tool
-    const toolResult = await executeTool(call.name, call.args, organizationId);
+    const toolResult = await executeTool(
+      call.name,
+      call.args,
+      organizationId,
+      role,
+    );
 
     if (toolResult.error) {
       return res.json({
@@ -359,7 +575,6 @@ export const chatWithAI = async (req, res) => {
       });
     }
 
-    // Send function response back to Gemini for final answer
     const followUp = await chat.sendMessage([
       {
         functionResponse: {
@@ -371,15 +586,21 @@ export const chatWithAI = async (req, res) => {
 
     let replyText = followUp.response.text();
     if (!replyText || replyText.trim() === "") {
-      const count = toolResult.count || 0;
-      const summary = toolResult.summary || {};
-      replyText = `I found ${count} results for your query. ${summary.totalValue ? `Total value: $${summary.totalValue}. ` : ""
-        }Please check the data for more details.`;
+      replyText = getFallbackReply(toolResult);
     }
 
     const responseType = getResponseType(call.name);
+    const suggestedQuestions = extractSuggestedQuestions(replyText);
 
-    // Save to history
+    const paginationMeta =
+      toolResult.page !== undefined
+        ? {
+          page: toolResult.page,
+          totalPages: toolResult.totalPages,
+          count: toolResult.count,
+        }
+        : null;
+
     await chatLogModel.create({
       organizationId,
       userId,
@@ -387,10 +608,23 @@ export const chatWithAI = async (req, res) => {
       query,
       response: replyText,
       intent: call.name,
+      metadata: {
+        toolName: call.name,
+        toolArgs: call.args ? JSON.parse(JSON.stringify(call.args)) : {},
+        suggestedQuestions,
+        pagination: paginationMeta,
+      },
     });
 
-    // Update context
+    if (toolResult.page !== undefined) {
+      context.lastPage = toolResult.page;
+    }
+    if (toolResult.filters) {
+      context.lastFilters = toolResult.filters;
+    }
+
     contextCache.set(contextKey, {
+      ...context,
       lastQuery: query,
       lastResults: toolResult,
       lastTool: call.name,
@@ -405,10 +639,11 @@ export const chatWithAI = async (req, res) => {
       reply: replyText,
       type: responseType,
       data,
+      suggestedQuestions,
     };
 
-    if (toolResult.count !== undefined) {
-      response.metadata = { count: toolResult.count };
+    if (paginationMeta) {
+      response.metadata = paginationMeta;
     }
     if (toolResult.summary) {
       response.metadata = { ...response.metadata, summary: toolResult.summary };
@@ -421,25 +656,28 @@ export const chatWithAI = async (req, res) => {
       success: false,
       message:
         "I'm having trouble processing your request. Please try again or rephrase your question.",
-      error: error.message,
     });
   }
 };
 
-/**
- * Chat with AI - streaming SSE endpoint.
- */
 export const chatWithAIStream = async (req, res) => {
   const organizationId = req.organizationId;
   const userId = req.user._id;
   const role = req.user.role;
   const { query } = req.body;
   const conversationId = getConversationId(req);
-
-  if (!query) {
+  console.log("query", query);
+  if (!query || query.trim().length === 0) {
     return res.status(400).json({
       success: false,
       message: "Query is required",
+    });
+  }
+
+  if (query.length > 500) {
+    return res.status(400).json({
+      success: false,
+      message: "Query is too long (maximum 500 characters)",
     });
   }
 
@@ -453,6 +691,11 @@ export const chatWithAIStream = async (req, res) => {
 
   const contextKey = getContextKey(organizationId, userId, conversationId);
   const context = contextCache.get(contextKey) || createEmptyContext();
+
+  if (organizationId) {
+    context.organizationId = organizationId;
+  }
+
   const enhancedQuery = getEnhancedQuery(query, context);
   const { model } = getChatModel(role);
   const chat = model.startChat();
@@ -513,6 +756,8 @@ export const chatWithAIStream = async (req, res) => {
           "I understand your request, but I couldn't generate a proper response. Could you please rephrase your question?";
       }
 
+      const suggestedQuestions = extractSuggestedQuestions(replyText);
+
       await chatLogModel.create({
         organizationId,
         userId,
@@ -520,6 +765,7 @@ export const chatWithAIStream = async (req, res) => {
         query,
         response: replyText,
         intent: null,
+        metadata: { suggestedQuestions },
       });
 
       contextCache.set(contextKey, {
@@ -537,6 +783,7 @@ export const chatWithAIStream = async (req, res) => {
         reply: replyText,
         responseType: "text",
         data: null,
+        suggestedQuestions,
       });
 
       cleanup();
@@ -544,7 +791,12 @@ export const chatWithAIStream = async (req, res) => {
       return;
     }
 
-    const toolResult = await executeTool(call.name, call.args, organizationId);
+    const toolResult = await executeTool(
+      call.name,
+      call.args,
+      organizationId,
+      role,
+    );
 
     if (toolResult.error) {
       sendStreamEvent(res, {
@@ -558,40 +810,247 @@ export const chatWithAIStream = async (req, res) => {
       return;
     }
 
+    const data = extractData(toolResult);
+    const schema = detectSchema(query, call.name, data);
+
     sendStreamEvent(res, {
       type: "tool",
       success: true,
       name: call.name,
-      data: extractData(toolResult),
+      data: data,
+      schema: schema,
     });
 
-    const finalPrompt = `
-You are StockPilot AI, the intelligent inventory and business analytics assistant built into the StockPilot platform.
-Answer the user's question using the tool result below.
+    const classifyIntent = (query = "", toolName = "", toolResult = {}) => {
+      const lower = query.toLowerCase();
 
-User question:
-${query}
+      if (
+        lower.includes("product") ||
+        lower.includes("item") ||
+        lower.includes("line item") ||
+        lower.includes("included") ||
+        lower.includes("purchased")
+      ) {
+        if (
+          toolName === "get_details" ||
+          toolName === "query_sales" ||
+          toolName === "query_purchases"
+        ) {
+          return "LINE_ITEMS";
+        }
+      }
 
-Tool used:
-${call.name}
+      if (
+        lower.includes("detail") ||
+        lower.includes("profile") ||
+        lower.includes("information") ||
+        lower.includes("who created") ||
+        lower.includes("customer info") ||
+        lower.includes("payment info") ||
+        lower.includes("tax") ||
+        lower.includes("discount")
+      ) {
+        if (toolName === "get_details") {
+          return "ENTITY_DETAILS";
+        }
+      }
+
+      if (
+        lower.includes("customer") ||
+        toolResult.summary?.customerProductsPurchased
+      ) {
+        return "CUSTOMER_PROFILE";
+      }
+
+      if (
+        lower.includes("dead stock") ||
+        lower.includes("low stock") ||
+        lower.includes("forecast") ||
+        lower.includes("anomaly") ||
+        lower.includes("suggestion") ||
+        lower.includes("performance") ||
+        lower.includes("risk") ||
+        lower.includes("insight") ||
+        toolName === "query_insights"
+      ) {
+        return "ANALYTICS_RISK";
+      }
+
+      return "LISTING_COMPACT";
+    };
+    const buildDynamicPrompt = (query, toolName, trimmedResult) => {
+      const intent = classifyIntent(query, toolName, trimmedResult);
+      const dataJson = JSON.stringify(trimmedResult, null, 2);
+
+      // Check if unsupported or error
+      if (trimmedResult?.isUnsupported === true || trimmedResult?.error === true) {
+        const msg = trimmedResult?.message || "Requested feature or entity type is not supported.";
+        return `You are StockPilot AI, an Inventory Analyst.
+User question: ${query}
+
+Tool error/unsupported details:
+${dataJson}
+
+INSTRUCTIONS:
+1. Respond in 1–2 plain, natural sentences explaining clearly that "${msg}".
+2. State 2–3 related inventory queries that the system CAN answer instead.
+3. CRITICAL: DO NOT output Markdown headers (like ## 📦 SUMMARY), DO NOT output markdown tables, DO NOT output empty bullet template sections.`;
+      }
+
+      // Check if result is empty
+      const isEmpty = trimmedResult?.summary?.isEmpty === true || (Array.isArray(trimmedResult?.products) && trimmedResult.products.length === 0 && Array.isArray(trimmedResult?.invoices) && trimmedResult.invoices.length === 0);
+      const emptyMessage = trimmedResult?.summary?.message || trimmedResult?.message || "No data found matching your criteria.";
+
+      if (isEmpty) {
+        // Check for positive status check (e.g., asking for out-of-stock items when none exist)
+        const isPositiveCheck = query.toLowerCase().includes("out of stock") || query.toLowerCase().includes("dead stock") || query.toLowerCase().includes("anomalies");
+        let emptyInstruction = "";
+
+        if (isPositiveCheck) {
+          emptyInstruction = `
+INTENT: The user checked for items/issues (e.g. out of stock/dead stock/anomalies), but 0 items match.
+INSTRUCTIONS:
+1. Respond in 1–2 clear, encouraging natural sentences stating that there are 0 matching items/issues at this time (e.g., "All products are currently in stock! No out-of-stock items exist at this time.").
+2. DO NOT output Markdown headers (like ## 📦 SUMMARY), DO NOT output empty markdown tables or zero-value summaries.
+3. Suggest 2-3 logical follow-up questions directly.`;
+        } else {
+          emptyInstruction = `
+INTENT: No matching records found for user query.
+INSTRUCTIONS:
+1. Respond in 1–2 polite natural sentences stating that no records match "${query}".
+2. Suggest 2-3 specific adjustments or alternative queries.
+3. DO NOT output Markdown headers (like ## 📦 SUMMARY), DO NOT output empty markdown tables or zero-value summaries.`;
+        }
+
+        return `You are StockPilot AI, an Inventory Analyst.
+User question: ${query}
 
 Tool result JSON:
-${JSON.stringify(toolResult, null, 2)}
+${dataJson}
 
-Instructions (MUST FOLLOW):
-1. IDENTITY: Identify yourself only as StockPilot AI. Speak like a professional inventory analyst or business consultant. Never mention Gemini, LLM, OpenAI, Google AI, or training details. Do not introduce yourself unless asked.
-2. VARY INTRODUCTIONS: Do not use repetitive openings (like "Here is the...", "Below is...", "Based on current data..."). Vary openings naturally based on the data (e.g. "I found 5 invoices matching Ahmed Khan").
-3. NO REPETITIVE ENDINGS: End naturally. Do not append "Let me know if you need anything else" or similar templates to the end of your response.
-4. EXPLAIN DATA NATURALLY: Write a short 1-2 sentence conversational summary introducing any table, highlighting key business metrics or values (like most valuable item or reorder alerts). Use natural expressions: "Your organization currently has four active team members" instead of "There are currently 4 team members."
-5. DYNAMIC STRUCTURE & INSIGHTS: Include 2-5 bulleted business insights below the table if sufficient data exists. Choose different response structures (Pattern A: Summary -> Table -> Insights; Pattern B: Key findings -> Table; Pattern C: Highlights -> Sections -> Table -> Insights).
-6. DASHBOARD STYLING:
-   - "Business Overview": High-level performance summary of sales, revenue, cost, and stock valuation.
-   - "Organization Snapshot": Complete operational picture focusing on team roles, active suppliers, status, and category counts.
-   - "Business Dashboard": Detailed KPIs and metrics (total valuation, profit margins, sales counts, pending order alerts).
-   - "Executive Summary": Management-level highlights focusing on profitability, gross margin, and severe alerts.
-7. READ-ONLY: Never perform or mention any write actions. Refuse politely if asked to delete, create, or update.
-8. FORMATTING: Generate clean, professional Markdown tables for any tabular lists or reports. Do not mention JSON, tool names, or internal reasoning.
+${emptyInstruction}
+Write in short, direct, friendly sentences.`;
+      }
+
+      const showingRangeText = trimmedResult?.showingRange ? `PAGINATION RANGE RULE: Include the exact stated range: "${trimmedResult.showingRange}" in the SUMMARY section.` : "";
+
+      let instructions = "";
+
+      if (intent === "LINE_ITEMS") {
+        instructions = `
+INTENT: The user wants to see specific line items or products within an invoice or purchase order.
+
+RULES:
+1. Answer the user's specific request FIRST. Provide a clean summary overview.
+2. Present the line items directly under "## 📊 INVOICE ITEMS" or "## 📊 PURCHASE ORDER ITEMS" as a Markdown table.
+3. DO NOT include "## 💡 AI INSIGHTS" or "## 🎯 RECOMMENDATIONS" because recommendations are NOT relevant for simple line item requests.
+4. ${showingRangeText}
+
+REQUIRED LAYOUT:
+## 📦 SUMMARY
+- (Key metrics and range)
+
+## 📊 INVOICE ITEMS
+| Product Name | SKU | Quantity | Unit Price | Subtotal | Profit | Margin |
+| --- | --- | --- | --- | --- | --- | --- |
 `;
+      } else if (intent === "ENTITY_DETAILS") {
+        instructions = `
+INTENT: Comprehensive details/profile for an entity (Invoice, PO, Supplier, Category, User, or Org).
+
+RULES:
+1. Present general information metrics under "## ℹ️ GENERAL INFORMATION".
+2. Present line items or catalog breakdown under "## 📊 PRIMARY CONTENT" as a Markdown table.
+3. ${showingRangeText}
+
+REQUIRED LAYOUT:
+## ℹ️ GENERAL INFORMATION
+- (Entity attributes as bullet points)
+
+## 📊 PRIMARY CONTENT
+| Product/Item Name | SKU | Quantity | ... |
+`;
+      } else if (intent === "CUSTOMER_PROFILE") {
+        instructions = `
+INTENT: Customer spending info or purchased items.
+
+RULES:
+1. Present customer spend metrics FIRST under "## 👤 CUSTOMER PROFILE".
+2. Present purchased products or invoice history under "## 📊 PURCHASED PRODUCTS" as a Markdown table.
+3. ${showingRangeText}
+
+REQUIRED LAYOUT:
+## 👤 CUSTOMER PROFILE
+- Customer Name: ...
+- Total Spent: PKR ...
+
+## 📊 PURCHASED PRODUCTS
+| Product Name | SKU | Quantity Purchased | Total Spent |
+`;
+      } else if (intent === "LISTING_COMPACT") {
+        instructions = `
+INTENT: Product list or entity listing overview.
+
+RULES:
+1. Provide quick metric summary under "## 📦 SUMMARY". Include ${showingRangeText}.
+2. Present a clean Markdown table of the primary fields under "## 📊 PRIMARY CONTENT".
+3. Provide 2-3 brief insights under "## 💡 AI INSIGHTS". INSIGHT RULE: Every insight MUST add comparative value across rows or highlight concentration risks / outliers — NEVER restate a single cell value directly.
+
+REQUIRED LAYOUT:
+## 📦 SUMMARY
+- (Summary metrics & pagination range)
+
+## 📊 PRIMARY CONTENT
+| Name/Number | SKU | Quantity | Selling Price | Status |
+
+## 💡 AI INSIGHTS
+- (2-3 analytical comparative observations)
+`;
+      } else {
+        instructions = `
+INTENT: Strategic analytical inquiry (Dead stock, stockout risk, forecasts, anomalies, overall summaries).
+
+RULES:
+1. Provide a comprehensive summary under "## 📦 SUMMARY". ${showingRangeText}
+2. Present data table under "## 📊 PRIMARY CONTENT".
+3. Provide 2-4 actionable insights under "## 💡 AI INSIGHTS". INSIGHT RULE: Every insight MUST provide comparative analysis across rows or identify concentration risks/outliers — NEVER restate a single cell value directly.
+4. Provide 2-4 strategic actions under "## 🎯 RECOMMENDATIONS".
+
+REQUIRED LAYOUT:
+## 📦 SUMMARY
+- (Key metrics & pagination range)
+
+## 📊 PRIMARY CONTENT
+| Product Name | SKU | Quantity | ... |
+
+## 💡 AI INSIGHTS
+- (Comparative observations)
+
+## 🎯 RECOMMENDATIONS
+- (Actionable steps)
+`;
+      }
+
+      return `You are StockPilot AI, an Inventory Analyst. Answer using ONLY the tool result data below. Never invent or estimate numbers.
+
+User question: ${query}
+
+Tool result JSON:
+${dataJson}
+
+${instructions}
+
+CRITICAL FORMATTING RULES:
+- Headers MUST start with '## ' (e.g. ## 📦 SUMMARY, ## 📊 PRIMARY CONTENT, ## 💡 AI INSIGHTS, ## 🎯 RECOMMENDATIONS)
+- Format currency as PKR 1,234,567.00
+- Format percentages as 43%
+- Each bullet point MUST start with "- " on its OWN SEPARATE LINE.
+- DO NOT use Unicode bullet symbols (like •).
+- Write like a knowledgeable colleague. Short, direct sentences.`;
+    };
+
+    const trimmedResult = trimToolResult(toolResult);
+    const finalPrompt = buildDynamicPrompt(query, call.name, trimmedResult);
 
     const followUpResult = await getPlainModel().generateContentStream(
       finalPrompt,
@@ -631,7 +1090,18 @@ Instructions (MUST FOLLOW):
       getFallbackReply(toolResult);
 
     const responseType = getResponseType(call.name);
-    const data = extractData(toolResult);
+    const suggestedQuestions = extractSuggestedQuestions(replyText, query);
+
+    const paginationMeta =
+      toolResult.page !== undefined
+        ? {
+          page: toolResult.page,
+          totalPages: toolResult.totalPages,
+          count: toolResult.count,
+          pageSize: toolResult.pageSize || CONSTANTS.DEFAULT_PAGE_LIMIT,
+          showingRange: toolResult.showingRange,
+        }
+        : null;
 
     await chatLogModel.create({
       organizationId,
@@ -640,12 +1110,36 @@ Instructions (MUST FOLLOW):
       query,
       response: replyText,
       intent: call.name,
+      metadata: {
+        toolName: call.name,
+        toolArgs: call.args ? JSON.parse(JSON.stringify(call.args)) : {},
+        suggestedQuestions,
+        pagination: paginationMeta,
+        tableData: data,
+        schema: schema,
+      },
     });
+    console.log(data);
+    console.log(toolResult);
+    console.log(replyText);
+
+    if (toolResult.page !== undefined) {
+      context.lastPage = toolResult.page;
+    }
 
     contextCache.set(contextKey, {
+      ...context,
       lastQuery: query,
       lastResults: toolResult,
       lastTool: call.name,
+      activeEntity:
+        call.name === "get_details" && call.args
+          ? {
+            type: call.args.type,
+            identifier: call.args.identifier,
+            data: toolResult,
+          }
+          : context.activeEntity,
       conversationCount: (context.conversationCount || 0) + 1,
     });
 
@@ -655,10 +1149,14 @@ Instructions (MUST FOLLOW):
       reply: replyText,
       responseType,
       data,
+      suggestedQuestions,
+      toolName: call.name,
+      toolArgs: call.args ? JSON.parse(JSON.stringify(call.args)) : {},
+      schema: schema,
     };
 
-    if (toolResult.count !== undefined) {
-      completePayload.metadata = { count: toolResult.count };
+    if (paginationMeta) {
+      completePayload.metadata = paginationMeta;
     }
     if (toolResult.summary) {
       completePayload.metadata = {
@@ -687,28 +1185,122 @@ Instructions (MUST FOLLOW):
       success: false,
       message:
         "I'm having trouble processing your request. Please try again or rephrase your question.",
-      error: error.message,
     });
     res.end();
   }
 };
 
-/**
- * Get chat history – optionally filtered by conversationId.
- */
+export const getChatPage = async (req, res) => {
+  try {
+    const organizationId = req.organizationId;
+    const role = req.user.role;
+    const { conversationId, messageLogId, page, toolName, toolArgs } = req.body;
+
+    if (!toolName) {
+      return res.status(400).json({
+        success: false,
+        message: "toolName is required",
+      });
+    }
+
+    if (!page || page < 1) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid page number is required",
+      });
+    }
+
+    let resolvedArgs =
+      toolArgs && typeof toolArgs === "object" ? toolArgs : null;
+
+    if (!resolvedArgs && messageLogId) {
+      try {
+        const log = await chatLogModel
+          .findById(messageLogId)
+          .select("metadata")
+          .lean();
+        if (
+          log?.metadata?.toolArgs &&
+          typeof log.metadata.toolArgs === "object"
+        ) {
+          resolvedArgs = log.metadata.toolArgs;
+        }
+      } catch {
+        // Non-fatal: fall through to default
+      }
+    }
+
+    if (!resolvedArgs) {
+      resolvedArgs = {};
+    }
+
+    const args = { ...resolvedArgs, page: Number(page) };
+
+    const toolResult = await executeTool(toolName, args, organizationId, role);
+
+    if (toolResult.error) {
+      return res.status(500).json({
+        success: false,
+        message: toolResult.message || "Failed to fetch page",
+      });
+    }
+
+    const data = extractData(toolResult);
+
+    const pagination =
+      toolResult.page !== undefined
+        ? {
+          page: toolResult.page,
+          totalPages: toolResult.totalPages,
+          count: toolResult.count,
+          pageSize: toolResult.pageSize || CONSTANTS.DEFAULT_PAGE_LIMIT,
+          showingRange: toolResult.showingRange,
+        }
+        : null;
+
+    return res.json({
+      success: true,
+      data,
+      pagination,
+    });
+  } catch (error) {
+    console.error("Error in getChatPage:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error while fetching page",
+    });
+  }
+};
+
 export const getChatHistory = async (req, res) => {
   try {
     const organizationId = req.organizationId;
     const userId = req.user._id;
+    const role = req.user.role;
     const {
       conversationId,
       limit = 50,
       intent,
       startDate,
       endDate,
+      targetOrganizationId,
     } = req.query;
 
-    const filter = { organizationId, userId };
+    const filter = { userId };
+
+    if (role === "super_admin" && targetOrganizationId) {
+      filter.organizationId = targetOrganizationId;
+    } else if (organizationId) {
+      filter.organizationId = organizationId;
+    } else if (role === "super_admin") {
+      // Super Admin without target org - show all
+    } else {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
     if (conversationId) filter.conversationId = conversationId;
     if (intent) filter.intent = intent;
     if (startDate || endDate) {
@@ -738,14 +1330,11 @@ export const getChatHistory = async (req, res) => {
     console.error("Error in getChatHistory:", error.message);
     res.status(500).json({
       success: false,
-      message: error.message || "Internal server error",
+      message: "Internal server error",
     });
   }
 };
 
-/**
- * Clear conversation context – for a specific conversation or all for the user.
- */
 export const clearContext = async (req, res) => {
   try {
     const organizationId = req.organizationId;
@@ -754,17 +1343,11 @@ export const clearContext = async (req, res) => {
       req.body?.conversationId || req.query?.conversationId;
 
     if (conversationId) {
-      // Delete specific conversation context
-      const contextKey = `${organizationId}_${userId}_${conversationId}`;
+      const contextKey = getContextKey(organizationId, userId, conversationId);
       contextCache.delete(contextKey);
     } else {
-      // Delete all contexts for this user
-      const prefix = `${organizationId}_${userId}_`;
-      for (const key of contextCache.keys()) {
-        if (key.startsWith(prefix)) {
-          contextCache.delete(key);
-        }
-      }
+      const prefix = `${organizationId || "super_admin"}_${userId}_`;
+      contextCache.clearByPrefix(prefix);
     }
 
     res.status(200).json({
@@ -775,7 +1358,7 @@ export const clearContext = async (req, res) => {
     console.error("Error in clearContext:", error.message);
     res.status(500).json({
       success: false,
-      message: error.message || "Internal server error",
+      message: "Internal server error",
     });
   }
 };
