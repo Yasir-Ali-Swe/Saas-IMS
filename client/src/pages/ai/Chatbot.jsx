@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+// pages/ChatbotPage.jsx
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useSearchParams, Link } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { ArrowUpIcon, Bot, Sparkles, Square } from "lucide-react";
@@ -18,432 +19,303 @@ import {
 import {
     useChatHistory,
     useChatWithAI,
-    useClearContext,
-    useChatPage,
 } from "@/hooks/useChat";
 
-const ACTIVE_CHAT_CONVERSATION_KEY = "stockpilot.activeChatConversationId";
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+const newConversationId = () =>
+    typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 const suggestionChips = [
-    "Which products are low in stock right now?",
-    "Evaluate Acme Corp delivery compliance",
-    "What was our total sales revenue this week?",
-    "Explain Zone A warehouse capacity issues",
+    "Show me all Products",
+    "Show all categories",
+    "Show me all suppliers",
+    "Show me all invoices",
 ];
 
-const createConversationId = () => {
-    if (typeof crypto !== "undefined" && crypto.randomUUID) {
-        return crypto.randomUUID();
-    }
-    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-};
-
-const readStoredConversationId = () => {
-    if (typeof window === "undefined") return null;
-    try {
-        return sessionStorage.getItem(ACTIVE_CHAT_CONVERSATION_KEY);
-    } catch {
-        return null;
-    }
-};
-
-const storeConversationId = (conversationId) => {
-    if (typeof window === "undefined" || !conversationId) return;
-    try {
-        sessionStorage.setItem(ACTIVE_CHAT_CONVERSATION_KEY, conversationId);
-    } catch {
-        // ignore
-    }
-};
-
+// ─────────────────────────────────────────────────────────────
+// Component
+// ─────────────────────────────────────────────────────────────
 function ChatbotPage() {
     const [searchParams, setSearchParams] = useSearchParams();
+
+    // The URL param "c" is the SINGLE source of truth for which conversation
+    // is active. We never generate a new ID inside a render cycle to avoid
+    // the ID-change → history-clear race condition.
     const urlConversationId = searchParams.get("c");
 
-    const clearMutation = useClearContext();
-    const chatPageMutation = useChatPage();
+    // On first render with no URL param, pick an ID once and write it to URL.
+    // Use a ref so the lazy-init only fires one time.
+    const initIdRef = useRef(urlConversationId || newConversationId());
 
-    const [conversationId, setConversationId] = useState(
-        () => urlConversationId || readStoredConversationId() || createConversationId()
-    );
-    const [localMessages, setLocalMessages] = useState([]);
-    const [input, setInput] = useState("");
+    // The conversation ID we are rendering. Derived purely from URL.
+    const activeConversationId = urlConversationId || initIdRef.current;
 
-    const textareaRef = useRef(null);
-    const abortControllerRef = useRef(null);
-    const pendingAssistantIdRef = useRef(null);
-    const isMountedRef = useRef(true);
-    const mutationConversationIdRef = useRef(null);
-    const currentConversationIdRef = useRef(conversationId);
-
-    const isHistoryConversation = Boolean(urlConversationId);
-    const activeConversationId = urlConversationId || conversationId;
-
+    // ── Chat history query ──────────────────────────────────────
     const {
         data: historyData,
         isLoading: historyLoading,
         error: historyError,
-    } = useChatHistory(
-        { conversationId: activeConversationId },
-        { enabled: Boolean(activeConversationId) }
-    );
+    } = useChatHistory(activeConversationId, {
+        enabled: Boolean(activeConversationId),
+    });
 
+    // ── Mutation ────────────────────────────────────────────────
     const chatMutation = useChatWithAI();
     const isPending = chatMutation.isPending;
-    const isPremiumUpgradeRequired =
-        historyError?.response?.status === 403 ||
-        chatMutation.error?.response?.status === 403;
 
+    // ── Local message list ──────────────────────────────────────
+    // "history" messages loaded from DB on mount / conversation switch.
+    // "live" messages optimistically added while streaming.
+    const [liveMessages, setLiveMessages] = useState([]);
+    const [isThinking, setIsThinking] = useState(false);
+    const [input, setInput] = useState("");
+
+    // Refs that survive re-renders without causing them
+    const textareaRef = useRef(null);
+    const abortControllerRef = useRef(null);
+    const pendingAssistantIdRef = useRef(null);
+    const isMountedRef = useRef(true);
+
+    // Track which conversation the in-flight mutation belongs to so we can
+    // discard stale callbacks when the user switches conversations mid-stream.
+    const mutationConvRef = useRef(null);
+    const activeConvRef = useRef(activeConversationId);
+
+    // ── On mount: write initial ID to URL if missing ────────────
     useEffect(() => {
-        if (urlConversationId) {
-            setConversationId(urlConversationId);
-            return;
+        isMountedRef.current = true;
+        if (!urlConversationId) {
+            setSearchParams({ c: initIdRef.current }, { replace: true });
         }
-        const stored = readStoredConversationId();
-        if (stored) {
-            setConversationId(stored);
-            return;
-        }
-        const newId = createConversationId();
-        setConversationId(newId);
-        storeConversationId(newId);
-    }, [urlConversationId]);
+        return () => {
+            isMountedRef.current = false;
+        };
+    }, []); // run once on mount only
 
+    // ── Keep the activeConvRef in sync ──────────────────────────
     useEffect(() => {
-        if (urlConversationId) return;
-        storeConversationId(conversationId);
-    }, [conversationId, urlConversationId]);
+        activeConvRef.current = activeConversationId;
+    }, [activeConversationId]);
 
+    // ── When the active conversation changes, clear live messages ─
+    const prevConvIdRef = useRef(activeConversationId);
     useEffect(() => {
-        currentConversationIdRef.current = conversationId;
-    }, [conversationId]);
+        if (prevConvIdRef.current === activeConversationId) return;
+        prevConvIdRef.current = activeConversationId;
 
-    useEffect(() => {
+        // Abort any in-flight stream
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
             abortControllerRef.current = null;
         }
         pendingAssistantIdRef.current = null;
-        mutationConversationIdRef.current = null;
+        mutationConvRef.current = null;
         chatMutation.reset();
-        setLocalMessages([]);
-        setInput("");
-        if (textareaRef.current) {
-            textareaRef.current.style.height = "auto";
-        }
-    }, [conversationId]);
 
-    useEffect(() => {
-        if (historyData?.data && !historyLoading) {
-            const sortedHistory = [...historyData.data].sort(
-                (a, b) => new Date(a.createdAt) - new Date(b.createdAt)
-            );
-            const chatMessages = sortedHistory.flatMap((log) => [
+        // Clear live messages — history will load from the query
+        setLiveMessages([]);
+        setIsThinking(false);
+        setInput("");
+        if (textareaRef.current) textareaRef.current.style.height = "auto";
+    }, [activeConversationId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // ── Derive the full displayed message list ──────────────────
+    // History messages come from the DB query. Live messages are appended on
+    // top during streaming.
+    const historyMessages = useMemo(() => {
+        if (!historyData?.data?.logs?.length) return [];
+        return [...historyData.data.logs]
+            .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+            .flatMap((log) => [
                 {
-                    id: `${log._id}-user`,
+                    id: `${log.id}-user`,
                     role: "user",
                     content: log.query,
                     source: "history",
+                    logQuery: log.query,
                 },
                 {
-                    id: `${log._id}-assistant`,
+                    id: `${log.id}-assistant`,
                     role: "assistant",
                     content: log.response,
                     source: "history",
-                    suggestedQuestions: log.metadata?.suggestedQuestions || [],
-                    pagination: log.metadata?.pagination || null,
-                    toolName: log.metadata?.toolName || null,
-                    toolArgs: log.metadata?.toolArgs || null,
-                    tableData: log.metadata?.tableData || null,
-                    userQueryText: log.query,
-                    schema: log.metadata?.schema || null,
-                    logId: log._id,
+                    metadata: log.metadata,
+                    intent: log.intent,
+                    createdAt: log.createdAt,
+                    logQuery: log.query,
                 },
             ]);
-            if (currentConversationIdRef.current === conversationId) {
-                setLocalMessages(chatMessages);
-            }
-        } else if (!historyLoading && isHistoryConversation) {
-            if (currentConversationIdRef.current === conversationId) {
-                setLocalMessages([]);
-            }
-        }
-    }, [historyData, historyLoading, isHistoryConversation, conversationId]);
+    }, [historyData]);
 
+    // Clear live messages when history re-fetches and streaming is idle,
+    // making historyMessages the single source of truth for completed turns.
     useEffect(() => {
-        isMountedRef.current = true;
-        return () => {
-            isMountedRef.current = false;
-        };
-    }, []);
+        if (!isPending && !isThinking && historyData?.data?.logs) {
+            setLiveMessages([]);
+        }
+    }, [historyData, isPending, isThinking]);
 
+    // The actual list shown in the UI: DB history + any in-progress live messages.
+    // Deduplicates history items (both user & assistant) whose query is in liveMessages.
+    const displayMessages = useMemo(() => {
+        if (liveMessages.length === 0) return historyMessages;
+
+        const liveUserQueries = new Set(
+            liveMessages.filter((m) => m.role === "user").map((m) => m.content)
+        );
+        const dedupedHistory = historyMessages.filter(
+            (m) => !(m.source === "history" && liveUserQueries.has(m.logQuery || m.content))
+        );
+        return [...dedupedHistory, ...liveMessages];
+    }, [historyMessages, liveMessages]);
+
+    const isPremiumUpgradeRequired =
+        historyError?.response?.status === 403 ||
+        chatMutation.error?.response?.status === 403;
+
+    // ── Form handlers ───────────────────────────────────────────
     const handleTextareaInput = (e) => {
-        const textarea = e.target;
-        textarea.style.height = "auto";
-        textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
+        const el = e.target;
+        el.style.height = "auto";
+        el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
         setInput(e.target.value);
     };
 
     const handleKeyDown = (e) => {
-        if (isHistoryConversation) return;
         if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
             handleSubmit(e);
         }
     };
 
-    const submitQuery = useCallback(async (query) => {
-        if (isHistoryConversation || !query.trim() || isPending) return;
+    // ── Send message ────────────────────────────────────────────
+    const submitQuery = useCallback(
+        async (query) => {
+            if (!query.trim() || isPending) return;
 
-        setInput("");
+            setInput("");
+            setIsThinking(true);
+            if (textareaRef.current) textareaRef.current.style.height = "auto";
 
-        if (textareaRef.current) {
-            textareaRef.current.style.height = "auto";
-        }
+            const userMsgId = `live-${Date.now()}-user`;
+            const assistantMsgId = `live-${Date.now()}-assistant`;
+            pendingAssistantIdRef.current = assistantMsgId;
+            mutationConvRef.current = activeConversationId;
 
-        const userMsgId = `${Date.now()}-user`;
-        const assistantMsgId = `${Date.now()}-assistant`;
-        pendingAssistantIdRef.current = assistantMsgId;
-        mutationConversationIdRef.current = conversationId;
+            // Optimistically append user + empty assistant bubble
+            setLiveMessages((prev) => [
+                ...prev,
+                { id: userMsgId, role: "user", content: query, source: "live" },
+                { id: assistantMsgId, role: "assistant", content: "", source: "live" },
+            ]);
 
-        setLocalMessages((prev) => [
-            ...prev,
-            {
-                id: userMsgId,
-                role: "user",
-                content: query,
-                source: "live",
-            },
-            {
-                id: assistantMsgId,
-                role: "assistant",
-                content: "",
-                source: "live",
-                suggestedQuestions: [],
-                pagination: null,
-                toolName: null,
-                toolArgs: null,
-                logId: null,
-                userQueryText: query,
-                schema: null,
-            },
-        ]);
+            const controller = new AbortController();
+            abortControllerRef.current = controller;
 
-        const controller = new AbortController();
-        abortControllerRef.current = controller;
+            chatMutation.mutate(
+                {
+                    message: query,
+                    conversationId: activeConversationId,
+                    signal: controller.signal,
+                    onThinking: () => { /* handled by isThinking state */ },
+                    onChunk: (_chunk, fullMarkdown) => {
+                        if (!isMountedRef.current) return;
+                        if (mutationConvRef.current !== activeConvRef.current) return;
+                        if (!pendingAssistantIdRef.current) return;
 
-        chatMutation.mutate(
-            {
-                query,
-                conversationId,
-                signal: controller.signal,
-                onChunk: (chunkText) => {
-                    if (!isMountedRef.current) return;
-                    if (mutationConversationIdRef.current !== currentConversationIdRef.current) return;
-                    if (!chunkText || !pendingAssistantIdRef.current) return;
-
-                    setLocalMessages((prev) =>
-                        prev.map((message) => {
-                            if (message.id !== pendingAssistantIdRef.current) {
-                                return message;
-                            }
-                            return {
-                                ...message,
-                                content: `${message.content || ""}${chunkText}`,
-                                source: "live",
-                            };
-                        })
-                    );
-                },
-                onTool: (res) => {
-                    if (!isMountedRef.current) return;
-                    if (mutationConversationIdRef.current !== currentConversationIdRef.current) return;
-
-                    const toolData = res?.data || null;
-                    const toolSchema = res?.schema || null;
-
-                    if (pendingAssistantIdRef.current) {
-                        setLocalMessages((prev) =>
-                            prev.map((message) => {
-                                if (message.id !== pendingAssistantIdRef.current) {
-                                    return message;
-                                }
-                                return {
-                                    ...message,
-                                    tableData: toolData,
-                                    schema: toolSchema,
-                                };
-                            })
+                        setIsThinking(false);
+                        setLiveMessages((prev) =>
+                            prev.map((m) =>
+                                m.id === pendingAssistantIdRef.current
+                                    ? { ...m, content: fullMarkdown }
+                                    : m
+                            )
                         );
-                    }
-                },
-                onComplete: (res) => {
-                    if (!isMountedRef.current) return;
-                    if (mutationConversationIdRef.current !== currentConversationIdRef.current) return;
+                    },
+                    onComplete: (res) => {
+                        if (!isMountedRef.current) return;
+                        if (mutationConvRef.current !== activeConvRef.current) return;
 
-                    const finalReply = res?.reply || "";
-                    const suggestedQuestions = Array.isArray(res?.suggestedQuestions)
-                        ? res.suggestedQuestions
-                        : [];
-                    const pagination = res?.metadata && res.metadata.page !== undefined
-                        ? {
-                            page: res.metadata.page,
-                            totalPages: res.metadata.totalPages,
-                            count: res.metadata.count,
+                        setIsThinking(false);
+                        const finalMarkdown = res.markdown || "";
+
+                        setLiveMessages((prev) =>
+                            prev.map((m) =>
+                                m.id === pendingAssistantIdRef.current
+                                    ? { ...m, content: finalMarkdown, intent: res.intent, entityRefs: res.entityRefs }
+                                    : m
+                            )
+                        );
+
+                        // Ensure the correct conversation ID is in the URL
+                        const resConvId = res.conversationId || activeConversationId;
+                        if (resConvId && searchParams.get("c") !== resConvId) {
+                            setSearchParams({ c: resConvId }, { replace: true });
                         }
-                        : null;
-                    const toolName = res?.toolName || null;
-                    const toolArgs = res?.toolArgs || null;
-                    const schema = res?.schema || null;
+                    },
+                },
+                {
+                    onError: (error) => {
+                        const isAbort =
+                            error?.name === "AbortError" ||
+                            error?.code === "ERR_CANCELED" ||
+                            error?.message?.includes("aborted");
+                        if (isAbort) return;
+                        if (!isMountedRef.current) return;
+                        if (mutationConvRef.current !== activeConvRef.current) return;
 
-                    if (pendingAssistantIdRef.current) {
-                        setLocalMessages((prev) =>
-                            prev.map((message) => {
-                                if (message.id !== pendingAssistantIdRef.current) {
-                                    return message;
-                                }
-                                return {
-                                    ...message,
-                                    content: finalReply || message.content,
-                                    source: "live",
-                                    suggestedQuestions,
-                                    pagination,
-                                    toolName,
-                                    toolArgs,
-                                    schema,
-                                    tableData: message.tableData || res?.data || null,
-                                };
-                            })
+                        setIsThinking(false);
+                        setLiveMessages((prev) =>
+                            prev.map((m) =>
+                                m.id === pendingAssistantIdRef.current
+                                    ? { ...m, content: "Sorry, I could not complete that request. Please try again." }
+                                    : m
+                            )
                         );
-                    }
-
-                    if (res?.conversationId && res.conversationId !== conversationId) {
-                        if (!urlConversationId) {
-                            setConversationId(res.conversationId);
-                            storeConversationId(res.conversationId);
-                            setSearchParams({ c: res.conversationId });
+                    },
+                    onSettled: () => {
+                        if (mutationConvRef.current === activeConvRef.current) {
+                            abortControllerRef.current = null;
+                            pendingAssistantIdRef.current = null;
                         }
-                    }
-                },
-            },
-            {
-                onError: (error) => {
-                    const isAbort =
-                        error?.name === "AbortError" ||
-                        error?.code === "ERR_CANCELED" ||
-                        error?.message?.includes("aborted");
-                    if (isAbort) return;
-                    if (!isMountedRef.current) return;
-                    if (mutationConversationIdRef.current !== currentConversationIdRef.current) return;
+                    },
+                }
+            );
+        },
+        [isPending, activeConversationId, chatMutation, searchParams, setSearchParams]
+    );
 
-                    if (pendingAssistantIdRef.current) {
-                        setLocalMessages((prev) =>
-                            prev.map((message) => {
-                                if (message.id !== pendingAssistantIdRef.current) {
-                                    return message;
-                                }
-                                return {
-                                    ...message,
-                                    content: "Sorry, I could not complete that request.",
-                                    source: "live",
-                                };
-                            })
-                        );
-                    }
-                },
-                onSettled: () => {
-                    if (mutationConversationIdRef.current === currentConversationIdRef.current) {
-                        abortControllerRef.current = null;
-                        pendingAssistantIdRef.current = null;
-                    }
-                },
-            }
-        );
-    }, [isPending, isHistoryConversation, conversationId, chatMutation, urlConversationId, setSearchParams]);
-
-    const handleSubmit = useCallback(async (e) => {
-        e.preventDefault();
-        if (!input.trim()) return;
-        await submitQuery(input.trim());
-    }, [input, submitQuery]);
+    const handleSubmit = useCallback(
+        async (e) => {
+            e.preventDefault();
+            if (!input.trim()) return;
+            await submitQuery(input.trim());
+        },
+        [input, submitQuery]
+    );
 
     const handleStopGeneration = () => {
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
             abortControllerRef.current = null;
             chatMutation.reset();
+            setIsThinking(false);
         }
     };
 
-    const handleClearContext = () => {
-        clearMutation.mutate(
-            { conversationId },
-            {
-                onSuccess: () => {
-                    setLocalMessages([]);
-                    setInput("");
-                },
-            }
-        );
-    };
+    const handleSuggestionClick = useCallback(
+        (question) => {
+            if (isPending) return;
+            submitQuery(question);
+        },
+        [isPending, submitQuery]
+    );
 
-    const handleSuggestionClick = useCallback((question) => {
-        if (isHistoryConversation || isPending) return;
-        submitQuery(question);
-    }, [isHistoryConversation, isPending, submitQuery]);
-
-    const handlePageChange = useCallback(async (messageId, newPage) => {
-        if (isPending || chatPageMutation.isPending) return;
-
-        const message = localMessages.find((m) => m.id === messageId);
-        if (!message || !message.toolName) return;
-
-        setLocalMessages((prev) =>
-            prev.map((m) =>
-                m.id === messageId ? { ...m, pageLoading: true } : m
-            )
-        );
-
-        try {
-            const result = await chatPageMutation.mutateAsync({
-                conversationId,
-                messageLogId: message.logId || null,
-                page: newPage,
-                toolName: message.toolName,
-                toolArgs: message.toolArgs ?? {},
-            });
-
-            if (!isMountedRef.current) return;
-
-            if (result.success) {
-                setLocalMessages((prev) =>
-                    prev.map((m) => {
-                        if (m.id !== messageId) return m;
-                        return {
-                            ...m,
-                            tableData: result.data,
-                            pagination: result.pagination,
-                            pageLoading: false,
-                        };
-                    })
-                );
-            } else {
-                setLocalMessages((prev) =>
-                    prev.map((m) =>
-                        m.id === messageId ? { ...m, pageLoading: false } : m
-                    )
-                );
-            }
-        } catch {
-            if (!isMountedRef.current) return;
-            setLocalMessages((prev) =>
-                prev.map((m) =>
-                    m.id === messageId ? { ...m, pageLoading: false } : m
-                )
-            );
-        }
-    }, [isPending, chatPageMutation, localMessages, conversationId]);
-
+    // ── Render ──────────────────────────────────────────────────
     if (isPremiumUpgradeRequired) {
         return (
             <div className="flex h-full w-full flex-col items-center justify-center p-6 text-center select-none max-w-md mx-auto">
@@ -465,11 +337,14 @@ function ChatbotPage() {
         );
     }
 
+    const showSkeleton = historyLoading && displayMessages.length === 0;
+    const showEmptyState = !historyLoading && displayMessages.length === 0 && !isPending && !isThinking;
+
     return (
         <MessageScrollerProvider>
             <div className="flex h-full w-full flex-col relative">
                 <div className="flex-1 overflow-hidden min-h-0 relative">
-                    {historyLoading && isHistoryConversation ? (
+                    {showSkeleton ? (
                         <div className="px-4 py-6 max-w-3xl mx-auto w-full flex flex-col gap-6">
                             <div className="flex justify-end w-full">
                                 <Skeleton className="h-10 w-1/3 rounded-2xl rounded-tr-none" />
@@ -481,7 +356,7 @@ function ChatbotPage() {
                                 <Skeleton className="h-10 w-1/4 rounded-2xl rounded-tr-none" />
                             </div>
                         </div>
-                    ) : localMessages.length === 0 ? (
+                    ) : showEmptyState ? (
                         <div className="flex h-full w-full flex-col items-center justify-center p-6 text-center select-none overflow-y-auto">
                             <motion.div
                                 initial={{ scale: 0.95, opacity: 0 }}
@@ -493,28 +368,22 @@ function ChatbotPage() {
                                     <Sparkles className="h-8 w-8 text-primary animate-pulse" />
                                 </div>
                                 <h2 className="text-xl font-bold text-foreground mb-2">
-                                    {isHistoryConversation
-                                        ? "No saved messages found"
-                                        : "How can I help you today?"}
+                                    How can I help you today?
                                 </h2>
                                 <p className="text-sm text-muted-foreground mb-8">
-                                    {isHistoryConversation
-                                        ? "This conversation has no stored messages."
-                                        : "Ask StockPilot about inventory levels, order forecasting, supplier metrics, and database anomalies."}
+                                    Ask StockPilot about inventory levels, order forecasting, supplier metrics, and database anomalies.
                                 </p>
-                                {!isHistoryConversation && (
-                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
-                                        {suggestionChips.map((chip, idx) => (
-                                            <button
-                                                key={idx}
-                                                onClick={() => handleSuggestionClick(chip)}
-                                                className="text-left px-4 py-3 rounded-xl border border-border bg-card/35 hover:bg-muted/50 hover:border-primary/30 transition-all duration-200 text-xs font-medium text-muted-foreground hover:text-foreground cursor-pointer shadow-2xs leading-relaxed"
-                                            >
-                                                {chip}
-                                            </button>
-                                        ))}
-                                    </div>
-                                )}
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+                                    {suggestionChips.map((chip, idx) => (
+                                        <button
+                                            key={idx}
+                                            onClick={() => handleSuggestionClick(chip)}
+                                            className="text-left px-4 py-3 rounded-xl border border-border bg-card/35 hover:bg-muted/50 hover:border-primary/30 transition-all duration-200 text-xs font-medium text-muted-foreground hover:text-foreground cursor-pointer shadow-2xs leading-relaxed"
+                                        >
+                                            {chip}
+                                        </button>
+                                    ))}
+                                </div>
                             </motion.div>
                         </div>
                     ) : (
@@ -523,54 +392,30 @@ function ChatbotPage() {
                                 <MessageScrollerContent className="px-4 pb-6 max-w-4xl mx-auto w-full">
                                     <div className="flex flex-col gap-6">
                                         <AnimatePresence initial={false}>
-                                            // In the message rendering section, add this check:
-                                            {localMessages.map((message) => {
-                                                // Check if this is an empty result message
-                                                const isEmptyResult = message?.summary?.isEmpty === true ||
-                                                    message?.isEmpty === true ||
-                                                    (message?.pagination?.count === 0 && message?.content?.includes("No data found"));
-
-                                                // If empty result, we want to show the friendly message without empty table
-                                                return (
-                                                    <MessageScrollerItem
-                                                        key={message.id}
+                                            {displayMessages.map((message) => (
+                                                <MessageScrollerItem
+                                                    key={message.id}
+                                                    scrollAnchor={message.role === "user"}
+                                                >
+                                                    <MessageAnimated
+                                                        message={message}
                                                         scrollAnchor={message.role === "user"}
-                                                    >
-                                                        <MessageAnimated
-                                                            message={{
-                                                                ...message,
-                                                                isEmpty: isEmptyResult,
-                                                            }}
-                                                            scrollAnchor={message.role === "user"}
-                                                            onSuggestionClick={handleSuggestionClick}
-                                                            onPageChange={handlePageChange}
-                                                            isHistoryConversation={isHistoryConversation}
-                                                            isChatPending={isPending}
-                                                        />
-                                                    </MessageScrollerItem>
-                                                );
-                                            })}
+                                                        isChatPending={isPending}
+                                                    />
+                                                </MessageScrollerItem>
+                                            ))}
                                         </AnimatePresence>
 
-                                        {isPending && !isHistoryConversation && (
+                                        {(isPending || isThinking) && (
                                             <div className="flex w-full gap-3 justify-start opacity-100 translate-y-0">
                                                 <div className="w-full max-w-full sm:w-auto sm:max-w-[85%] bg-background border border-border text-foreground px-5 py-4 rounded-2xl rounded-tl-none shadow-2xs flex items-center gap-2.5 select-none">
                                                     <span className="text-xs text-muted-foreground font-medium">
-                                                        Thinking...
+                                                        {isThinking ? "Analyzing your request..." : "Thinking..."}
                                                     </span>
                                                     <span className="flex gap-1 items-center h-2">
-                                                        <span
-                                                            className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-bounce"
-                                                            style={{ animationDelay: "0ms" }}
-                                                        />
-                                                        <span
-                                                            className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-bounce"
-                                                            style={{ animationDelay: "150ms" }}
-                                                        />
-                                                        <span
-                                                            className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-bounce"
-                                                            style={{ animationDelay: "300ms" }}
-                                                        />
+                                                        <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-bounce" style={{ animationDelay: "0ms" }} />
+                                                        <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-bounce" style={{ animationDelay: "150ms" }} />
+                                                        <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-bounce" style={{ animationDelay: "300ms" }} />
                                                     </span>
                                                 </div>
                                             </div>
@@ -596,17 +441,15 @@ function ChatbotPage() {
                                 onChange={handleTextareaInput}
                                 onKeyDown={handleKeyDown}
                                 placeholder={
-                                    isHistoryConversation
-                                        ? "History is read-only"
-                                        : isPending
-                                            ? "Processing..."
-                                            : "Type your message here..."
+                                    isPending || isThinking
+                                        ? "Processing..."
+                                        : "Type your message here..."
                                 }
                                 className="flex-1 max-h-20 min-h-6 bg-transparent border-0 p-0 text-sm text-foreground placeholder:text-muted-foreground focus:ring-0 focus-visible:outline-hidden resize-none py-1 pr-12 scrollbar-thin overflow-y-auto leading-relaxed"
                                 style={{ height: "auto" }}
-                                disabled={isPending || isHistoryConversation}
+                                disabled={isPending || isThinking}
                             />
-                            {isPending ? (
+                            {(isPending || isThinking) ? (
                                 <Button
                                     type="button"
                                     size="icon"
@@ -622,7 +465,7 @@ function ChatbotPage() {
                                     type="submit"
                                     size="icon"
                                     variant="default"
-                                    disabled={!input.trim() || isHistoryConversation || isPending}
+                                    disabled={!input.trim() || isPending || isThinking}
                                     className="absolute right-3 bottom-3 h-8 w-8 rounded-lg transition-all duration-200 cursor-pointer shrink-0"
                                 >
                                     <ArrowUpIcon className="h-4 w-4" />
@@ -631,9 +474,7 @@ function ChatbotPage() {
                             )}
                         </form>
                         <p className="mt-2 text-center text-[10px] text-muted-foreground select-none">
-                            {isHistoryConversation
-                                ? "History conversations are read-only."
-                                : "StockPilot can make mistakes. Please verify important inventory details."}
+                            StockPilot can make mistakes. Please verify important inventory details.
                         </p>
                     </div>
                 </div>
@@ -643,4 +484,3 @@ function ChatbotPage() {
 }
 
 export default ChatbotPage;
-
