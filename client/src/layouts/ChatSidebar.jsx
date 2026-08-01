@@ -1,10 +1,13 @@
+// layouts/ChatSidebar.jsx
 import { useMemo } from 'react';
 import { useSelector } from 'react-redux';
+import { useSearchParams, Link } from 'react-router-dom';
 import {
     Boxes,
     BadgeCheckIcon,
     CreditCardIcon,
     LogOutIcon,
+    Plus,
 } from 'lucide-react';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -32,8 +35,10 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { selectUser } from '@/store/slices/authSlice';
 import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
 
-import { useChatHistory } from '@/hooks/useChat';
+import { useConversations } from '@/hooks/useChat';
+import { useLogoutUser } from '@/hooks/useAuth';
 
 const ACTIVE_CHAT_CONVERSATION_KEY = 'stockpilot.activeChatConversationId';
 
@@ -57,11 +62,6 @@ const formatTime = (dateString) => {
     }
 };
 
-import { useSearchParams, Link } from 'react-router-dom';
-import { useLogoutUser } from '@/hooks/useAuth';
-import { Button } from '@/components/ui/button';
-import { Plus } from 'lucide-react';
-
 export const ChatSidebar = () => {
     const user = useSelector(selectUser);
     const { state, isMobile } = useSidebar();
@@ -69,48 +69,21 @@ export const ChatSidebar = () => {
     const [searchParams, setSearchParams] = useSearchParams();
     const activeConversation = searchParams.get('c') || 'live';
     const logoutMutation = useLogoutUser();
-    const { data: chatHistoryResponse } = useChatHistory({ limit: 200 }, { staleTime: 60 * 1000 });
 
+    // Use the new useConversations hook
+    const { data: conversationsData, isLoading: conversationsLoading } = useConversations();
     const recentConversations = useMemo(() => {
-        const logs = chatHistoryResponse?.data || [];
-        const conversationMap = new Map();
-
-        logs.forEach((log) => {
-            const existing = conversationMap.get(log.conversationId);
-            const current = {
-                conversationId: log.conversationId,
-                title: log.query?.trim() || 'Untitled conversation',
-                preview: log.response?.trim() || log.query?.trim() || 'Conversation',
-                updatedAt: log.createdAt,
-            };
-
-            if (!existing || new Date(current.updatedAt) > new Date(existing.updatedAt)) {
-                conversationMap.set(log.conversationId, current);
-            }
-        });
-
-        return [...conversationMap.values()]
-            .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
-            .slice(0, 8);
-    }, [chatHistoryResponse]);
-
-    const clearLiveConversationState = () => {
-        try {
-            sessionStorage.removeItem(ACTIVE_CHAT_CONVERSATION_KEY);
-        } catch {
-            // Ignore storage failures and keep the navigation working.
-        }
-
-        window.dispatchEvent(new Event('chatbot:new-chat'));
-    };
-
-    const setActiveConversation = (id) => {
-        setSearchParams({ c: id });
-    };
+        if (!conversationsData?.data?.conversations) return [];
+        return conversationsData.data.conversations;
+    }, [conversationsData]);
 
     const handleNewChat = () => {
-        clearLiveConversationState();
-        setSearchParams({}, { replace: true });
+        // Navigate to a brand-new conversation ID. Chatbot.jsx detects the
+        // changed URL param and resets state via the conversation-switch effect.
+        const newId = crypto.randomUUID
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        setSearchParams({ c: newId }, { replace: false });
     };
 
     return (
@@ -135,51 +108,43 @@ export const ChatSidebar = () => {
                             <Plus className="h-3.5 w-3.5" />
                             New Chat
                         </Button>
-                        <SidebarGroupLabel className="text-muted-foreground uppercase tracking-wider text-xs px-2 py-1 mb-2 select-none">
-                            Active Session
-                        </SidebarGroupLabel>
                         <SidebarGroupContent className="flex-1 min-h-0 flex flex-col">
                             <ScrollArea className="flex-1 min-h-0 pr-1">
                                 <div className="flex flex-col gap-1">
-                                    <button
-                                        onClick={handleNewChat}
-                                        className={cn(
-                                            "w-full text-left px-3 py-2 text-sm transition-all duration-200 ease-in-out truncate rounded-r-md border-l-2 select-none cursor-pointer",
-                                            activeConversation === 'live'
-                                                ? "bg-accent/40 border-primary font-semibold text-foreground"
-                                                : "border-transparent text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-                                        )}
-                                    >
-                                        <span className="block truncate">StockPilot Assistant</span>
-                                    </button>
-
                                     {recentConversations.length > 0 && (
                                         <div className="pt-3">
                                             <p className="px-2 pb-2 text-[10px] uppercase tracking-wider text-muted-foreground select-none">
                                                 Recent Chats
                                             </p>
                                             <div className="flex flex-col gap-1">
-                                                {recentConversations.map((conversation) => {
-                                                    const isActive = activeConversation === conversation.conversationId;
+                                                {conversationsLoading ? (
+                                                    <div className="px-3 py-2 text-sm text-muted-foreground">
+                                                        Loading conversations...
+                                                    </div>
+                                                ) : (
+                                                    recentConversations.map((conversation) => {
+                                                        const isActive = activeConversation === conversation.id;
 
-                                                    return (
-                                                        <button
-                                                            key={conversation.conversationId}
-                                                            onClick={() => setActiveConversation(conversation.conversationId)}
-                                                            className={cn(
-                                                                "w-full text-left px-3 py-2 text-sm transition-all duration-200 ease-in-out rounded-r-md border-l-2 select-none cursor-pointer",
-                                                                isActive
-                                                                    ? "bg-accent/40 border-primary font-semibold text-foreground"
-                                                                    : "border-transparent text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-                                                            )}
-                                                        >
-                                                            <span className="block truncate">{conversation.title}</span>
-                                                            <span className="block truncate text-[11px] text-muted-foreground/80">
-                                                                {formatTime(conversation.updatedAt)}
-                                                            </span>
-                                                        </button>
-                                                    );
-                                                })}
+                                                        return (
+                                                            <button
+                                                                key={conversation.id}
+                                                                onClick={() => setSearchParams({ c: conversation.id })}
+                                                                className={cn(
+                                                                    "w-full text-left px-3 py-2 text-sm transition-all duration-200 ease-in-out rounded-r-md border-l-2 select-none cursor-pointer",
+                                                                    isActive
+                                                                        ? "bg-accent/40 border-primary font-semibold text-foreground"
+                                                                        : "border-transparent text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                                                                )}
+                                                            >
+                                                                <span className="block truncate">{conversation.firstMessage}</span>
+                                                                <span className="block truncate text-[11px] text-muted-foreground/80">
+                                                                    {formatTime(conversation.updatedAt)}
+                                                                    {conversation.messageCount > 1 && ` · ${conversation.messageCount} messages`}
+                                                                </span>
+                                                            </button>
+                                                        );
+                                                    })
+                                                )}
                                             </div>
                                         </div>
                                     )}
@@ -189,7 +154,6 @@ export const ChatSidebar = () => {
                     </SidebarGroup>
                 )}
             </SidebarContent>
-
 
             <SidebarFooter className="border-t border-sidebar-border">
                 <SidebarMenu>
