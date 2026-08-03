@@ -29,7 +29,7 @@ const buildConversationHistory = async (
   const chronologicalLogs = logs.reverse();
 
   const history = [];
-  let lastEntityRefs = null;
+  const accumulatedEntityRefs = {};
 
   for (const log of chronologicalLogs) {
     history.push({
@@ -55,20 +55,21 @@ const buildConversationHistory = async (
     });
 
     if (log.metadata && log.metadata.entityRefs) {
-      lastEntityRefs = log.metadata.entityRefs;
+      Object.assign(accumulatedEntityRefs, log.metadata.entityRefs);
     }
   }
 
   let contextNote = null;
-  if (lastEntityRefs && Object.keys(lastEntityRefs).length > 0) {
-    const refs = [];
-    for (const [key, value] of Object.entries(lastEntityRefs)) {
-      refs.push(`${key}: ${value}`);
-    }
-    contextNote = `The user was last looking at: ${refs.join(", ")}. Resolve any pronouns ("that", "this", "it") using this context.`;
+  if (Object.keys(accumulatedEntityRefs).length > 0) {
+    const refs = Object.entries(accumulatedEntityRefs).map(
+      ([key, value]) => `${key}: ${value}`,
+    );
+    contextNote = `Recent context entities in conversation: ${refs.join(
+      ", ",
+    )}. Resolve pronouns ("this", "that", "it", "them", "these", "their") using this active context.`;
   }
 
-  return { history, contextNote, lastEntityRefs };
+  return { history, contextNote, lastEntityRefs: accumulatedEntityRefs };
 };
 
 // ============================================================
@@ -164,7 +165,7 @@ export const sendMessageStream = async (req, res) => {
 
   try {
     const { message, conversationId } = req.body;
-    console.log("Message Stream is called.");
+    console.log("Message Stream is called.")
 
     if (!message || message.trim().length === 0) {
       res.write(
@@ -223,6 +224,17 @@ export const sendMessageStream = async (req, res) => {
       scopeContext,
       contextNote,
     )) {
+      if (event.status) {
+        res.write(
+          `data: ${JSON.stringify({
+            event: "thinking",
+            message: event.status,
+            done: false,
+          })}\n\n`,
+        );
+        continue;
+      }
+
       if (event.error) {
         hasError = true;
         res.write(
@@ -403,9 +415,9 @@ export const listConversations = async (req, res) => {
         $group: {
           _id: "$conversationId",
           firstMessage: { $first: "$query" }, // oldest message = real conversation title
-          lastMessage: { $last: "$query" }, // newest message
+          lastMessage: { $last: "$query" },   // newest message
           createdAt: { $first: "$createdAt" }, // when the conversation started
-          updatedAt: { $last: "$createdAt" }, // when it was last active
+          updatedAt: { $last: "$createdAt" },  // when it was last active
           messageCount: { $sum: 1 },
         },
       },
