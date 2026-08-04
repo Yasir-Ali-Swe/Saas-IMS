@@ -26,7 +26,7 @@ StockPilot is a multi-tenant, AI-powered inventory management platform built wit
 
 - React
 - Tailwind CSS + shadcn/ui
-- Redux Toolkit (client state) + RTK Query (server state / API layer)
+- Redux Toolkit (client state) + Tanstack Query + Axios (server state / API layer)
 - React Hook Form + Zod (validation)
 - Recharts (charts)
 
